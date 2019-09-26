@@ -235,14 +235,15 @@ pyi_arch_extract2fs(ARCHIVE_STATUS *status, TOC *ptoc)
  * The search space uses the given sizes because on Windows and OS X, the code signing
  * will add padding between the end of the COOKIE and the beginning of the signature
  * to align the signature to a quadword or a page boundary respectively. On Linux,
- * we use objtool to insert the archive into the bootloader, and objtool will
- * move the ELF section headers so they follow the cookie, so we need to search backward
- * past the section headers to find the cookie.
+ * we use objtool to insert the archive into the bootloader and on runtime parse the
+ * ELF headers to extract the precise end offset.
  */
 #if defined(WIN32)
 #define SEARCH_SIZE (8 + sizeof(COOKIE))
-#else
+#elif defined(__APPLE__)
 #define SEARCH_SIZE (4096 + sizeof(COOKIE))
+#else
+#define SEARCH_SIZE (sizeof(COOKIE))
 #endif
 
 static int
@@ -378,6 +379,145 @@ findDigitalSignature(ARCHIVE_STATUS * const status)
 }
 
 /*
+ * Try to find the pydata section in an ELF executable.
+ * Returns the end of the section if found.
+ */
+static int
+findElfSection(ARCHIVE_STATUS * const status)
+{
+#if !defined(WIN32) && !defined(__APPLE__)
+    char head[64];
+    uint16_t endianess_bytes = 0x0201;
+    int8_t bits;
+    uint64_t e_shoff;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+    char *section;
+    uint64_t shstr_offset;
+    uint64_t shstr_size;
+    char *shstr;
+    uint32_t section_idx;
+    uint64_t pydata_offset;
+    uint64_t pydata_size;
+
+    fseek(status->fp, 0, SEEK_SET);
+    if (fread(head, 64, 1, status->fp) != 1) {
+        return -1;
+    }
+
+    /* Check if ELF magic present */
+    if (head[0] != 0x7F || head[1] != 'E' || head[2] != 'L' || head[3] != 'F') {
+        VS("LOADER: %s is not an ELF binary\n", status->archivename);
+        return -1;
+    }
+
+    /* Ensure endianess of file matches */
+    if (head[0x05] != *(uint8_t*)&endianess_bytes) {
+        VS("LOADER: %s endianess does not match CPU\n", status->archivename);
+        return -1;
+    }
+
+    /* Ensure ELF version is supported */
+    if (head[0x06] != 1 || *(uint32_t*)(head + 0x14) != 1) {
+        VS("LOADER: %s has an unknown ELF version\n", status->archivename);
+        return -1;
+    }
+
+    /* Load ELF section header parameters */
+    bits = head[0x04]; /* 2=64, 1=32 */
+    if (bits == 2) {
+        e_shoff = *(uint64_t*)(head + 0x28);
+        e_shentsize = *(uint16_t*)(head + 0x3a);
+        e_shnum = *(uint16_t*)(head + 0x3c);
+        e_shstrndx = *(uint16_t*)(head + 0x3e);
+    } else {
+        e_shoff = *(uint32_t*)(head + 0x20);
+        e_shentsize = *(uint16_t*)(head + 0x2e);
+        e_shnum = *(uint16_t*)(head + 0x30);
+        e_shstrndx = *(uint16_t*)(head + 0x32);
+    }
+
+    section = malloc(e_shentsize);
+    if (section == NULL) {
+        FATAL_PERROR("malloc", "Could not allocate buffer for section header.");
+        return -1;
+    }
+
+    /* Load shstr section into buffer */
+    fseek(status->fp, e_shoff + e_shentsize * e_shstrndx, SEEK_SET);
+    if (fread(section, e_shentsize, 1, status->fp) != 1) {
+        free(section);
+        VS("LOADER: %s could not read shstr section header\n", status->archivename);
+        return -1;
+    }
+
+    if (bits == 2) {
+        shstr_offset = *(uint64_t*)(section + 0x18);
+        shstr_size = *(uint64_t*)(section + 0x20);
+    } else {
+        shstr_offset = *(uint32_t*)(section + 0x10);
+        shstr_size = *(uint32_t*)(section + 0x14);
+    }
+
+    shstr = malloc(shstr_size);
+    if (shstr == NULL) {
+        free(section);
+        FATAL_PERROR("malloc", "Could not allocate buffer for ELF shstrs.");
+        return -1;
+    }
+
+    fseek(status->fp, shstr_offset, SEEK_SET);
+    if (fread(shstr, shstr_size, 1, status->fp) != 1) {
+        free(section);
+        free(shstr);
+        VS("LOADER: %s could not read shstr section\n", status->archivename);
+        return -1;
+    }
+
+    /* Find section named "pydata" */
+    for (section_idx=0; section_idx<e_shnum; section_idx++) {
+        uint32_t name_offset;
+
+        fseek(status->fp, e_shoff + e_shentsize * section_idx, SEEK_SET);
+        if (fread(section, e_shentsize, 1, status->fp) != 1) {
+            free(section);
+            free(shstr);
+            VS("LOADER: %s could not read section header\n", status->archivename);
+            return -1;
+        }
+
+        name_offset = *(uint32_t*)(section);
+        if (!strncmp(shstr + name_offset, "pydata", shstr_size-name_offset)) {
+            break;
+        }
+    }
+
+    if (section_idx == e_shnum) {
+        free(section);
+        free(shstr);
+        VS("LOADER: %s could not find pydata section\n", status->archivename);
+        return -1;
+    }
+
+    /* Calculate and return end of section */
+    if (bits == 2) {
+        pydata_offset = *(uint64_t*)(section + 0x18);
+        pydata_size = *(uint64_t*)(section + 0x20);
+    } else {
+        pydata_offset = *(uint32_t*)(section + 0x10);
+        pydata_size = *(uint32_t*)(section + 0x14);
+    }
+
+    free(section);
+    free(shstr);
+    return pydata_offset + pydata_size;
+#else /* !defined(WIN32) && !defined(__APPLE__) */
+    return -1;
+#endif
+}
+
+/*
  * Open the archive.
  * Sets f_archiveFile, f_pkgstart, f_tocbuff and f_cookie.
  */
@@ -398,6 +538,8 @@ pyi_arch_open(ARCHIVE_STATUS *status)
      */
 #if defined(WIN32) || defined(__APPLE__)
     search_end = findDigitalSignature(status);
+#else
+    search_end = findElfSection(status);
 #endif
 
     /* Signature not found or not applicable for this platform. Stop searching
